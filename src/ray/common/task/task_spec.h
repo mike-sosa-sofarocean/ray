@@ -22,6 +22,8 @@ typedef std::pair<ResourceSet, FunctionDescriptor> SchedulingClassDescriptor;
 typedef int SchedulingClass;
 
 /// Wrapper class of protobuf `TaskSpec`, see `common.proto` for details.
+/// TODO(ekl) we should consider passing around std::unique_ptrs<TaskSpecification>
+/// instead `const TaskSpecification`, since this class is actually mutable.
 class TaskSpecification : public MessageWrapper<rpc::TaskSpec> {
  public:
   /// Construct an empty task specification. This should not be used directly.
@@ -72,7 +74,11 @@ class TaskSpecification : public MessageWrapper<rpc::TaskSpec> {
 
   ObjectID ArgId(size_t arg_index, size_t id_index) const;
 
-  ObjectID ReturnId(size_t return_index) const;
+  ObjectID ReturnId(size_t return_index, TaskTransportType transport_type) const;
+
+  ObjectID ReturnIdForPlasma(size_t return_index) const {
+    return ReturnId(return_index, TaskTransportType::RAYLET);
+  }
 
   const uint8_t *ArgData(size_t arg_index) const;
 
@@ -132,7 +138,7 @@ class TaskSpecification : public MessageWrapper<rpc::TaskSpec> {
 
   ActorID ActorId() const;
 
-  ActorHandleID ActorHandleId() const;
+  TaskID CallerId() const;
 
   uint64_t ActorCounter() const;
 
@@ -140,9 +146,11 @@ class TaskSpecification : public MessageWrapper<rpc::TaskSpec> {
 
   ObjectID PreviousActorTaskDummyObjectId() const;
 
-  std::vector<ActorHandleID> NewActorHandles() const;
-
   bool IsDirectCall() const;
+
+  int MaxActorConcurrency() const;
+
+  bool IsDetachedActor() const;
 
   ObjectID ActorDummyObject() const;
 

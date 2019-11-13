@@ -4,13 +4,16 @@ from __future__ import print_function
 
 import logging
 import time
+import six
 
 from ray.tune.error import TuneError
 from ray.tune.experiment import convert_to_experiment_list, Experiment
 from ray.tune.analysis import ExperimentAnalysis
 from ray.tune.suggest import BasicVariantGenerator
 from ray.tune.trial import Trial, DEBUG_PRINT_INTERVAL
+from ray.tune.trainable import Trainable
 from ray.tune.ray_trial_executor import RayTrialExecutor
+from ray.tune.registry import get_trainable_cls
 from ray.tune.syncer import wait_for_sync
 from ray.tune.trial_runner import TrialRunner
 from ray.tune.progress_reporter import CLIReporter, JupyterNotebookReporter
@@ -40,6 +43,16 @@ def _make_scheduler(args):
     else:
         raise TuneError("Unknown scheduler: {}, should be one of {}".format(
             args.scheduler, _SCHEDULERS.keys()))
+
+
+def _check_default_resources_override(run_identifier):
+    if not isinstance(run_identifier, six.string_types):
+        # If obscure dtype, assume it is overriden.
+        return True
+    trainable_cls = get_trainable_cls(run_identifier)
+    return hasattr(trainable_cls, "default_resource_request") and (
+        trainable_cls.default_resource_request.__code__ !=
+        Trainable.default_resource_request.__code__)
 
 
 def run(run_or_experiment,
@@ -137,10 +150,10 @@ def run(run_or_experiment,
             for individual trials.
         export_formats (list): List of formats that exported at the end of
             the experiment. Default is None.
-        max_failures (int): Try to recover a trial from its last
-            checkpoint at least this many times. Only applies if
-            checkpointing is enabled. Setting to -1 will lead to infinite
-            recovery retries. Defaults to 3.
+        max_failures (int): Try to recover a trial at least this many times.
+            Ray will recover from the latest checkpoint if present.
+            Setting to -1 will lead to infinite recovery retries.
+            Setting to 0 will disable retries. Defaults to 3.
         restore (str): Path to checkpoint. Only makes sense to set if
             running 1 trial. Defaults to None.
         search_alg (SearchAlgorithm): Search Algorithm. Defaults to
@@ -249,6 +262,24 @@ def run(run_or_experiment,
         reporter = JupyterNotebookReporter(overwrite=verbose < 2)
     else:
         reporter = CLIReporter()
+
+    # User Warning for GPUs
+    if trial_executor.has_gpus():
+        if isinstance(resources_per_trial,
+                      dict) and "gpu" in resources_per_trial:
+            # "gpu" is manually set.
+            pass
+        elif _check_default_resources_override(experiment.run_identifier):
+            # "default_resources" is manually overriden.
+            pass
+        else:
+            logger.warning("Tune detects GPUs, but no trials are using GPUs. "
+                           "To enable trials to use GPUs, set "
+                           "tune.run(resources_per_trial={'gpu': 1}...) "
+                           "which allows Tune to expose 1 GPU to each trial. "
+                           "You can also override "
+                           "`Trainable.default_resource_request` if using the "
+                           "Trainable API.")
 
     last_debug = 0
     while not runner.is_finished():

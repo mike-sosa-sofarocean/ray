@@ -10,7 +10,6 @@ from ray.includes.common cimport (
     ResourceSet,
 )
 from ray.includes.unique_ids cimport (
-    CActorHandleID,
     CActorID,
     CJobID,
     CObjectID,
@@ -53,7 +52,7 @@ cdef extern from "ray/common/task/task_spec.h" nogil:
         c_bool ArgByRef(uint64_t arg_index) const
         int ArgIdCount(uint64_t arg_index) const
         CObjectID ArgId(uint64_t arg_index, uint64_t id_index) const
-        CObjectID ReturnId(uint64_t return_index) const
+        CObjectID ReturnIdForPlasma(uint64_t return_index) const
         const uint8_t *ArgData(uint64_t arg_index) const
         size_t ArgDataSize(uint64_t arg_index) const
         const uint8_t *ArgMetadata(uint64_t arg_index) const
@@ -71,10 +70,8 @@ cdef extern from "ray/common/task/task_spec.h" nogil:
         CObjectID PreviousActorTaskDummyObjectId() const
         uint64_t MaxActorReconstructions() const
         CActorID ActorId() const
-        CActorHandleID ActorHandleId() const
         uint64_t ActorCounter() const
         CObjectID ActorDummyObject() const
-        c_vector[CActorHandleID] NewActorHandles() const
 
 
 cdef extern from "ray/common/task/task_execution_spec.h" nogil:

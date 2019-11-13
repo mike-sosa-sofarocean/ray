@@ -1,8 +1,9 @@
 import time
 
-import ray
 import numpy as np
 import pandas as pd
+
+import ray
 
 
 @ray.remote(num_cpus=0)
@@ -27,11 +28,11 @@ class MetricMonitor:
         return True
 
     def add_target(self, target_handle):
-        hex_id = target_handle._ray_core_handle.actor_id().hex()
+        hex_id = target_handle._actor_id.hex()
         self.actor_handles[hex_id] = target_handle
 
     def remove_target(self, target_handle):
-        hex_id = target_handle._ray_core_handle.actor_id().hex()
+        hex_id = target_handle._actor_id.hex()
         self.actor_handles.pop(hex_id)
 
     def scrape(self):
@@ -46,6 +47,7 @@ class MetricMonitor:
             handle._serve_metric.remote()
             for handle in self.actor_handles.values()
         ]
+        # TODO(simon): handle the possibility that an actor_handle is removed
         for handle_result in ray.get(result):
             for metric_name, metric_info in handle_result.items():
                 data_entry = {

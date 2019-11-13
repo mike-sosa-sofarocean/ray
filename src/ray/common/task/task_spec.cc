@@ -74,8 +74,10 @@ size_t TaskSpecification::NumArgs() const { return message_->args_size(); }
 
 size_t TaskSpecification::NumReturns() const { return message_->num_returns(); }
 
-ObjectID TaskSpecification::ReturnId(size_t return_index) const {
-  return ObjectID::ForTaskReturn(TaskId(), return_index + 1, /*transport_type=*/0);
+ObjectID TaskSpecification::ReturnId(size_t return_index,
+                                     TaskTransportType transport_type) const {
+  return ObjectID::ForTaskReturn(TaskId(), return_index + 1,
+                                 static_cast<uint8_t>(transport_type));
 }
 
 bool TaskSpecification::ArgByRef(size_t arg_index) const {
@@ -151,16 +153,15 @@ std::vector<std::string> TaskSpecification::DynamicWorkerOptions() const {
       message_->actor_creation_task_spec().dynamic_worker_options());
 }
 
+TaskID TaskSpecification::CallerId() const {
+  return TaskID::FromBinary(message_->caller_id());
+}
+
 // === Below are getter methods specific to actor tasks.
 
 ActorID TaskSpecification::ActorId() const {
   RAY_CHECK(IsActorTask());
   return ActorID::FromBinary(message_->actor_task_spec().actor_id());
-}
-
-ActorHandleID TaskSpecification::ActorHandleId() const {
-  RAY_CHECK(IsActorTask());
-  return ActorHandleID::FromBinary(message_->actor_task_spec().actor_handle_id());
 }
 
 uint64_t TaskSpecification::ActorCounter() const {
@@ -182,18 +183,25 @@ ObjectID TaskSpecification::PreviousActorTaskDummyObjectId() const {
 
 ObjectID TaskSpecification::ActorDummyObject() const {
   RAY_CHECK(IsActorTask() || IsActorCreationTask());
-  return ReturnId(NumReturns() - 1);
-}
-
-std::vector<ActorHandleID> TaskSpecification::NewActorHandles() const {
-  RAY_CHECK(IsActorTask());
-  return IdVectorFromProtobuf<ActorHandleID>(
-      message_->actor_task_spec().new_actor_handles());
+  return ReturnId(NumReturns() - 1, TaskTransportType::RAYLET);
 }
 
 bool TaskSpecification::IsDirectCall() const {
+  if (IsActorCreationTask()) {
+    return message_->actor_creation_task_spec().is_direct_call();
+  } else {
+    return message_->is_direct_call();
+  }
+}
+
+int TaskSpecification::MaxActorConcurrency() const {
   RAY_CHECK(IsActorCreationTask());
-  return message_->actor_creation_task_spec().is_direct_call();
+  return message_->actor_creation_task_spec().max_concurrency();
+}
+
+bool TaskSpecification::IsDetachedActor() const {
+  RAY_CHECK(IsActorCreationTask());
+  return message_->actor_creation_task_spec().is_detached();
 }
 
 std::string TaskSpecification::DebugString() const {
@@ -220,12 +228,13 @@ std::string TaskSpecification::DebugString() const {
     // Print actor creation task spec.
     stream << ", actor_creation_task_spec={actor_id=" << ActorCreationId()
            << ", max_reconstructions=" << MaxActorReconstructions()
-           << ", is_direct_call=" << IsDirectCall() << "}";
+           << ", is_direct_call=" << IsDirectCall()
+           << ", is_detached=" << IsDetachedActor() << "}";
   } else if (IsActorTask()) {
     // Print actor task spec.
     stream << ", actor_task_spec={actor_id=" << ActorId()
-           << ", actor_handle_id=" << ActorHandleId()
-           << ", actor_counter=" << ActorCounter() << "}";
+           << ", actor_caller_id=" << CallerId() << ", actor_counter=" << ActorCounter()
+           << "}";
   }
 
   return stream.str();

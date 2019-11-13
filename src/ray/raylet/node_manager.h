@@ -103,7 +103,7 @@ class NodeManager : public rpc::NodeManagerServiceHandler {
   std::string DebugString() const;
 
   /// Record metrics.
-  void RecordMetrics() const;
+  void RecordMetrics();
 
   /// Get the port of the node manager rpc server.
   int GetServerPort() const { return node_manager_server_.GetPort(); }
@@ -243,13 +243,6 @@ class NodeManager : public rpc::NodeManagerServiceHandler {
   void FinishAssignedActorCreationTask(const ActorID &parent_actor_id,
                                        const TaskSpecification &task_spec,
                                        bool resumed_from_checkpoint, int port);
-  /// Extend actor frontier after an actor task or actor creation task executes.
-  ///
-  /// \param dummy_object Dummy object corresponding to the task.
-  /// \param actor_id The relevant actor ID.
-  /// \param actor_handle_id The relevant actor handle ID.
-  void ExtendActorFrontier(const ObjectID &dummy_object, const ActorID &actor_id,
-                           const ActorHandleID &actor_handle_id);
   /// Make a placement decision for placeable tasks given the resource_map
   /// provided. This will perform task state transitions and task forwarding.
   ///
@@ -401,6 +394,12 @@ class NodeManager : public rpc::NodeManagerServiceHandler {
   /// \return Void.
   void HandleWorkerAvailable(const std::shared_ptr<LocalClientConnection> &client);
 
+  /// Handle the case that a worker is available.
+  ///
+  /// \param worker The pointer to the worker
+  /// \return Void.
+  void HandleWorkerAvailable(const std::shared_ptr<Worker> &worker);
+
   /// Handle a client that has disconnected. This can be called multiple times
   /// on the same client because this is triggered both when a client
   /// disconnects and when the node manager fails to write a message to the
@@ -413,11 +412,19 @@ class NodeManager : public rpc::NodeManagerServiceHandler {
       const std::shared_ptr<LocalClientConnection> &client,
       bool intentional_disconnect = false);
 
-  /// Process client message of SubmitTask
+  /// Process client message of RequestWorkerLease
+  ///
+  /// \param client The client that sent the message.
+  /// \param message_data A pointer to the message data.
+  /// \return Void.
+  void ProcessRequestWorkerLeaseMessage(
+      const std::shared_ptr<LocalClientConnection> &client, const uint8_t *message_data);
+
+  /// Process client message of ReturnWorkerMessage
   ///
   /// \param message_data A pointer to the message data.
   /// \return Void.
-  void ProcessSubmitTaskMessage(const uint8_t *message_data);
+  void ProcessReturnWorkerMessage(const uint8_t *message_data);
 
   /// Process client message of FetchOrReconstruct
   ///
@@ -434,6 +441,14 @@ class NodeManager : public rpc::NodeManagerServiceHandler {
   /// \return Void.
   void ProcessWaitRequestMessage(const std::shared_ptr<LocalClientConnection> &client,
                                  const uint8_t *message_data);
+
+  /// Process client message of WaitForDirectActorCallArgsRequest
+  ///
+  /// \param client The client that sent the message.
+  /// \param message_data A pointer to the message data.
+  /// \return Void.
+  void ProcessWaitForDirectActorCallArgsRequestMessage(
+      const std::shared_ptr<LocalClientConnection> &client, const uint8_t *message_data);
 
   /// Process client message of PushErrorRequest
   ///
@@ -452,6 +467,13 @@ class NodeManager : public rpc::NodeManagerServiceHandler {
   ///
   /// \param message_data A pointer to the message data.
   void ProcessNotifyActorResumedFromCheckpoint(const uint8_t *message_data);
+
+  /// Process client message of ReportActiveObjectIDs.
+  ///
+  /// \param client The client that sent the message.
+  /// \param message_data A pointer to the message data.
+  void ProcessReportActiveObjectIDs(const std::shared_ptr<LocalClientConnection> &client,
+                                    const uint8_t *message_data);
 
   /// Update actor frontier when a task finishes.
   /// If the task is an actor creation task and the actor was resumed from a checkpoint,
@@ -487,10 +509,20 @@ class NodeManager : public rpc::NodeManagerServiceHandler {
   /// \return void.
   void FinishAssignTask(const TaskID &task_id, Worker &worker, bool success);
 
+  /// Handle a `SubmitTask` request.
+  void HandleSubmitTask(const rpc::SubmitTaskRequest &request,
+                        rpc::SubmitTaskReply *reply,
+                        rpc::SendReplyCallback send_reply_callback) override;
+
   /// Handle a `ForwardTask` request.
   void HandleForwardTask(const rpc::ForwardTaskRequest &request,
                          rpc::ForwardTaskReply *reply,
                          rpc::SendReplyCallback send_reply_callback) override;
+
+  /// Handle a `NodeStats` request.
+  void HandleNodeStatsRequest(const rpc::NodeStatsRequest &request,
+                              rpc::NodeStatsReply *reply,
+                              rpc::SendReplyCallback send_reply_callback) override;
 
   /// Push an error to the driver if this node is full of actors and so we are
   /// unable to schedule new tasks or actors at all.
@@ -518,6 +550,8 @@ class NodeManager : public rpc::NodeManagerServiceHandler {
   bool fair_queueing_enabled_;
   /// Whether we have printed out a resource deadlock warning.
   bool resource_deadlock_warned_ = false;
+  /// Whether we have recorded any metrics yet.
+  bool recorded_metrics_ = false;
   /// The path to the ray temp dir.
   std::string temp_dir_;
   /// The timer used to get profiling information from the object manager and
@@ -560,12 +594,15 @@ class NodeManager : public rpc::NodeManagerServiceHandler {
   rpc::NodeManagerGrpcService node_manager_service_;
 
   /// The `ClientCallManager` object that is shared by all `NodeManagerClient`s
-  /// as well as all `WorkerTaskClient`s.
+  /// as well as all `CoreWorkerClient`s.
   rpc::ClientCallManager client_call_manager_;
 
   /// Map from node ids to clients of the remote node managers.
   std::unordered_map<ClientID, std::unique_ptr<rpc::NodeManagerClient>>
       remote_node_manager_clients_;
+
+  /// Map of workers leased out to direct call clients.
+  std::unordered_map<int, std::shared_ptr<Worker>> leased_workers_;
 };
 
 }  // namespace raylet

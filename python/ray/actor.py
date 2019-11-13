@@ -7,6 +7,7 @@ import inspect
 import logging
 import six
 import sys
+import weakref
 
 from abc import ABCMeta, abstractmethod
 from collections import namedtuple
@@ -16,7 +17,7 @@ import ray.ray_constants as ray_constants
 import ray._raylet
 import ray.signature as signature
 import ray.worker
-from ray import ActorID, ActorHandleID, ActorClassID, profiling
+from ray import ActorID, ActorClassID
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +58,8 @@ def method(*args, **kwargs):
 class ActorMethod(object):
     """A class used to invoke an actor method.
 
-    Note: This class is instantiated only while the actor method is being
-    invoked (so that it doesn't keep a reference to the actor handle and
-    prevent it from going out of scope).
+    Note: This class only keeps a weak ref to the actor, unless it has been
+    passed to a remote function. This avoids delays in GC of the actor.
 
     Attributes:
         _actor: A handle to the actor.
@@ -75,8 +75,13 @@ class ActorMethod(object):
             "test_decorated_method" in "python/ray/tests/test_actor.py".
     """
 
-    def __init__(self, actor, method_name, num_return_vals, decorator=None):
-        self._actor = actor
+    def __init__(self,
+                 actor,
+                 method_name,
+                 num_return_vals,
+                 decorator=None,
+                 hardref=False):
+        self._actor_ref = weakref.ref(actor)
         self._method_name = method_name
         self._num_return_vals = num_return_vals
         # This is a decorator that is used to wrap the function invocation (as
@@ -85,6 +90,13 @@ class ActorMethod(object):
         # cases, it should call the function that was passed into the decorator
         # and return the resulting ObjectIDs.
         self._decorator = decorator
+
+        # Acquire a hard ref to the actor, this is useful mainly when passing
+        # actor method handles to remote functions.
+        if hardref:
+            self._actor_hard_ref = actor
+        else:
+            self._actor_hard_ref = None
 
     def __call__(self, *args, **kwargs):
         raise Exception("Actor methods cannot be called directly. Instead "
@@ -96,15 +108,14 @@ class ActorMethod(object):
         return self._remote(args, kwargs)
 
     def _remote(self, args=None, kwargs=None, num_return_vals=None):
-        if args is None:
-            args = []
-        if kwargs is None:
-            kwargs = {}
         if num_return_vals is None:
             num_return_vals = self._num_return_vals
 
         def invocation(args, kwargs):
-            return self._actor._actor_method_call(
+            actor = self._actor_hard_ref or self._actor_ref()
+            if actor is None:
+                raise RuntimeError("Lost reference to actor")
+            return actor._actor_method_call(
                 self._method_name,
                 args=args,
                 kwargs=kwargs,
@@ -115,6 +126,22 @@ class ActorMethod(object):
             invocation = self._decorator(invocation)
 
         return invocation(args, kwargs)
+
+    def __getstate__(self):
+        return {
+            "actor": self._actor_ref(),
+            "method_name": self._method_name,
+            "num_return_vals": self._num_return_vals,
+            "decorator": self._decorator,
+        }
+
+    def __setstate__(self, state):
+        self.__init__(
+            state["actor"],
+            state["method_name"],
+            state["num_return_vals"],
+            state["decorator"],
+            hardref=True)
 
 
 class ActorClassMetadata(object):
@@ -193,7 +220,6 @@ class ActorClassMetadata(object):
             # supported. We don't raise an exception because if the actor
             # inherits from a class that has a method whose signature we
             # don't support, there may not be much the user can do about it.
-            signature.check_signature_supported(method, warn=True)
             self.method_signatures[method_name] = signature.extract_signature(
                 method, ignore_first=not ray.utils.is_class_method(method))
             # Set the default number of return values for this method.
@@ -277,7 +303,6 @@ class ActorClass(object):
         DerivedActorClass.__module__ = modified_class.__module__
         DerivedActorClass.__name__ = name
         DerivedActorClass.__qualname__ = name
-
         # Construct the base object.
         self = DerivedActorClass.__new__(DerivedActorClass)
 
@@ -301,6 +326,26 @@ class ActorClass(object):
         """
         return self._remote(args=args, kwargs=kwargs)
 
+    def options(self, **options):
+        """Convenience method for creating an actor with options.
+
+        Same arguments as Actor._remote(), but returns a wrapped actor class
+        that a non-underscore .remote() can be called on.
+
+        Examples:
+            # The following two calls are equivalent.
+            >>> Actor._remote(num_cpus=4, max_concurrency=8, args=[x, y])
+            >>> Actor.options(num_cpus=4, max_concurrency=8).remote(x, y)
+        """
+
+        actor_cls = self
+
+        class ActorOptionWrapper(object):
+            def remote(self, *args, **kwargs):
+                return actor_cls._remote(args=args, kwargs=kwargs, **options)
+
+        return ActorOptionWrapper()
+
     def _remote(self,
                 args=None,
                 kwargs=None,
@@ -308,7 +353,11 @@ class ActorClass(object):
                 num_gpus=None,
                 memory=None,
                 object_store_memory=None,
-                resources=None):
+                resources=None,
+                is_direct_call=None,
+                max_concurrency=None,
+                name=None,
+                detached=False):
         """Create an actor.
 
         This method allows more flexibility than the remote method because
@@ -325,6 +374,12 @@ class ActorClass(object):
                 this actor when creating objects.
             resources: The custom resources required by the actor creation
                 task.
+            is_direct_call: Use direct actor calls.
+            max_concurrency: The max number of concurrent calls to allow for
+                this actor. This only works with direct actor calls.
+            name: The globally unique name for the actor.
+            detached: Whether the actor should be kept alive after driver
+                exits.
 
         Returns:
             A handle to the newly created actor.
@@ -333,6 +388,16 @@ class ActorClass(object):
             args = []
         if kwargs is None:
             kwargs = {}
+        if is_direct_call is None:
+            is_direct_call = False
+        if max_concurrency is None:
+            max_concurrency = 1
+
+        if max_concurrency > 1 and not is_direct_call:
+            raise ValueError(
+                "setting max_concurrency requires is_direct_call=True")
+        if max_concurrency < 1:
+            raise ValueError("max_concurrency must be >= 1")
 
         worker = ray.worker.get_global_worker()
         if worker.mode is None:
@@ -340,6 +405,23 @@ class ActorClass(object):
                             "has been called.")
 
         meta = self.__ray_metadata__
+
+        if detached and name is None:
+            raise Exception("Detached actors must be named. "
+                            "Please use Actor._remote(name='some_name') "
+                            "to associate the name.")
+
+        # Check whether the name is already taken.
+        if name is not None:
+            try:
+                ray.experimental.get_actor(name)
+            except ValueError:  # name is not taken, expected.
+                pass
+            else:
+                raise ValueError(
+                    "The name {name} is already taken. Please use "
+                    "a different name or get existing actor using "
+                    "ray.experimental.get_actor('{name}')".format(name=name))
 
         # Set the actor's default resources if not already set. First three
         # conditions are to check that no resources were specified in the
@@ -372,9 +454,6 @@ class ActorClass(object):
             actor_id = ActorID.from_random()
             worker.actors[actor_id] = meta.modified_class(
                 *copy.deepcopy(args), **copy.deepcopy(kwargs))
-            core_handle = ray._raylet.ActorHandle(
-                actor_id, ActorHandleID.nil(), worker.current_job_id,
-                function_descriptor.get_function_descriptor_list())
         else:
             # Export the actor.
             if (meta.last_export_session_and_job !=
@@ -400,17 +479,17 @@ class ActorClass(object):
             if actor_method_cpu == 1:
                 actor_placement_resources = resources.copy()
                 actor_placement_resources["CPU"] += 1
-
             function_signature = meta.method_signatures[function_name]
-            creation_args = signature.extend_args(function_signature, args,
-                                                  kwargs)
-            core_handle = worker.core_worker.create_actor(
+            creation_args = signature.flatten_args(function_signature, args,
+                                                   kwargs)
+            actor_id = worker.core_worker.create_actor(
                 function_descriptor.get_function_descriptor_list(),
                 creation_args, meta.max_reconstructions, resources,
-                actor_placement_resources)
+                actor_placement_resources, is_direct_call, max_concurrency,
+                detached)
 
         actor_handle = ActorHandle(
-            core_handle,
+            actor_id,
             meta.modified_class.__module__,
             meta.class_name,
             meta.actor_method_names,
@@ -420,6 +499,9 @@ class ActorClass(object):
             actor_method_cpu,
             worker.current_session_and_job,
             original_handle=True)
+
+        if name is not None:
+            ray.experimental.register_actor(name, actor_handle)
 
         return actor_handle
 
@@ -436,7 +518,7 @@ class ActorHandle(object):
     cloudpickle).
 
     Attributes:
-        _ray_core_handle: Core worker actor handle for this actor.
+        _ray_actor_id: Actor ID.
         _ray_module_name: The module name of this actor.
         _ray_actor_method_names: The names of the actor methods.
         _ray_method_decorators: Optional decorators for the function
@@ -454,7 +536,7 @@ class ActorHandle(object):
     """
 
     def __init__(self,
-                 core_handle,
+                 actor_id,
                  module_name,
                  class_name,
                  actor_method_names,
@@ -464,7 +546,7 @@ class ActorHandle(object):
                  actor_method_cpus,
                  session_and_job,
                  original_handle=False):
-        self._ray_core_handle = core_handle
+        self._ray_actor_id = actor_id
         self._ray_module_name = module_name
         self._ray_original_handle = original_handle
         self._ray_actor_method_names = actor_method_names
@@ -474,6 +556,20 @@ class ActorHandle(object):
         self._ray_class_name = class_name
         self._ray_actor_method_cpus = actor_method_cpus
         self._ray_session_and_job = session_and_job
+        self._ray_function_descriptor_lists = {
+            method_name: FunctionDescriptor(
+                self._ray_module_name, method_name,
+                self._ray_class_name).get_function_descriptor_list()
+            for method_name in self._ray_method_signatures.keys()
+        }
+
+        for method_name in actor_method_names:
+            method = ActorMethod(
+                self,
+                method_name,
+                self._ray_method_num_return_vals[method_name],
+                decorator=self._ray_method_decorators.get(method_name))
+            setattr(self, method_name, method)
 
     def _actor_method_call(self,
                            method_name,
@@ -499,28 +595,24 @@ class ActorHandle(object):
         """
         worker = ray.worker.get_global_worker()
 
-        worker.check_connected()
-
+        args = args or []
+        kwargs = kwargs or {}
         function_signature = self._ray_method_signatures[method_name]
-        if args is None:
-            args = []
-        if kwargs is None:
-            kwargs = {}
-        args = signature.extend_args(function_signature, args, kwargs)
 
-        function_descriptor = FunctionDescriptor(
-            self._ray_module_name, method_name, self._ray_class_name)
-
-        with profiling.profile("submit_task"):
-            if worker.mode == ray.LOCAL_MODE:
-                function = getattr(worker.actors[self._actor_id], method_name)
-                object_ids = worker.local_mode_manager.execute(
-                    function, function_descriptor, args, num_return_vals)
-            else:
-                object_ids = worker.core_worker.submit_actor_task(
-                    self._ray_core_handle,
-                    function_descriptor.get_function_descriptor_list(), args,
-                    num_return_vals, {"CPU": self._ray_actor_method_cpus})
+        if not args and not kwargs and not function_signature:
+            list_args = []
+        else:
+            list_args = signature.flatten_args(function_signature, args,
+                                               kwargs)
+        if worker.mode == ray.LOCAL_MODE:
+            function = getattr(worker.actors[self._actor_id], method_name)
+            object_ids = worker.local_mode_manager.execute(
+                function, method_name, args, kwargs, num_return_vals)
+        else:
+            object_ids = worker.core_worker.submit_actor_task(
+                self._ray_actor_id,
+                self._ray_function_descriptor_lists[method_name], list_args,
+                num_return_vals, self._ray_actor_method_cpus)
 
         if len(object_ids) == 1:
             object_ids = object_ids[0]
@@ -532,30 +624,6 @@ class ActorHandle(object):
     # Make tab completion work.
     def __dir__(self):
         return self._ray_actor_method_names
-
-    def __getattribute__(self, attr):
-        try:
-            # Check whether this is an actor method.
-            actor_method_names = object.__getattribute__(
-                self, "_ray_actor_method_names")
-            if attr in actor_method_names:
-                # We create the ActorMethod on the fly here so that the
-                # ActorHandle doesn't need a reference to the ActorMethod.
-                # The ActorMethod has a reference to the ActorHandle and
-                # this was causing cyclic references which were prevent
-                # object deallocation from behaving in a predictable
-                # manner.
-                return ActorMethod(
-                    self,
-                    attr,
-                    self._ray_method_num_return_vals[attr],
-                    decorator=self._ray_method_decorators.get(attr))
-        except AttributeError:
-            pass
-
-        # If the requested attribute is not a registered method, fall back
-        # to default __getattribute__.
-        return object.__getattribute__(self, attr)
 
     def __repr__(self):
         return "Actor({}, {})".format(self._ray_class_name,
@@ -579,21 +647,21 @@ class ActorHandle(object):
             # and we don't need to send `__ray_terminate__` again.
             logger.warning(
                 "Actor is garbage collected in the wrong driver." +
-                " Actor id = %s, class name = %s.",
-                self._ray_core_handle.actor_id(), self._ray_class_name)
+                " Actor id = %s, class name = %s.", self._ray_actor_id,
+                self._ray_class_name)
             return
         if worker.connected and self._ray_original_handle:
-            # TODO(rkn): Should we be passing in the actor cursor as a
-            # dependency here?
-            self.__ray_terminate__.remote()
+            # Note: in py2 the weakref is destroyed prior to calling __del__
+            # so we need to set the hardref here briefly
+            try:
+                self.__ray_terminate__._actor_hard_ref = self
+                self.__ray_terminate__.remote()
+            finally:
+                self.__ray_terminate__._actor_hard_ref = None
 
     @property
     def _actor_id(self):
-        return self._ray_core_handle.actor_id()
-
-    @property
-    def _actor_handle_id(self):
-        return self._ray_core_handle.actor_handle_id()
+        return self._ray_actor_id
 
     def _serialization_helper(self, ray_forking):
         """This is defined in order to make pickling work.
@@ -605,8 +673,13 @@ class ActorHandle(object):
         Returns:
             A dictionary of the information needed to reconstruct the object.
         """
+        worker = ray.worker.get_global_worker()
+        worker.check_connected()
         state = {
-            "core_handle": self._ray_core_handle.fork(ray_forking).to_bytes(),
+            # Local mode just uses the actor ID.
+            "core_handle": worker.core_worker.serialize_actor_handle(
+                self._ray_actor_id)
+            if hasattr(worker, "core_worker") else self._ray_actor_id,
             "module_name": self._ray_module_name,
             "class_name": self._ray_class_name,
             "actor_method_names": self._ray_actor_method_names,
@@ -632,8 +705,10 @@ class ActorHandle(object):
         self.__init__(
             # TODO(swang): Accessing the worker's current task ID is not
             # thread-safe.
-            ray._raylet.ActorHandle.from_bytes(state["core_handle"],
-                                               worker.current_task_id),
+            # Local mode just uses the actor ID.
+            worker.core_worker.deserialize_and_register_actor_handle(
+                state["core_handle"])
+            if hasattr(worker, "core_worker") else state["core_handle"],
             state["module_name"],
             state["class_name"],
             state["actor_method_names"],
